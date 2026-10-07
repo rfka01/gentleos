@@ -71,8 +71,10 @@ sub make_disk {
     print "Done\n";
 }
 
-# 360K and 720K native images. 360K may be too small once the initrd is large;
-# the builder dies with a clear "exceeds padded size" message if so, in which
-# case use the 720K image.
-make_disk("GT16DMV72.IMG", 720 * 1024, 0x00);
-make_disk("GT16DMV.IMG",   0,          0x00);   # exact-size image, any capacity
+# 360 KB native image - the real DMV MS-DOS 2.11 floppy format: 40 tracks x
+# 2 heads x 9 sectors x 512 B (confirmed from the DMV DOS disk's BPB and OEM
+# field "16BIT"). The boot sector reads with SPT=9/HEADS=2, so this is the
+# geometry every real DMV can read. Kernel + initrd currently need ~150 of the
+# 720 sectors, so there is ample room; the builder dies with a clear "exceeds
+# padded size" message if they ever outgrow 360 KB.
+make_disk("GT16DMV.IMG", 360 * 1024, 0x00);
