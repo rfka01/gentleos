@@ -165,14 +165,16 @@ load_region:
     call read_track_run             ; -> scratch, sets run_len; CF on error
     jc .fail
     call copy_run_up                ; scratch -> dst_seg:dst_ofs
-    ; advance destination by run_len*512 bytes (handle offset carry into seg)
+    ; Advance the destination by run_len*512 bytes = run_len*32 paragraphs,
+    ; in the SEGMENT, keeping dst_ofs fixed and small. A single copy is at most
+    ; 9*512 = 0x1200 bytes, so with dst_ofs <= 0x100 the rep movsw can never
+    ; cross a 64 KB boundary. (Advancing the offset instead let DI wrap inside
+    ; ES mid-copy and overwrite the start of the segment - which destroyed the
+    ; initrd header at 3000:0000, so Gallery and Player found no files.)
     mov ax, [run_len]
-    mov cl, 9
-    shl ax, cl                      ; run_len * 512
-    add [dst_ofs], ax
-    jnc .no_carry
-    add word [dst_seg], 0x1000      ; offset wrapped 64 KB -> +0x1000 paras
-.no_carry:
+    mov cl, 5
+    shl ax, cl                      ; run_len * 32 paragraphs
+    add [dst_seg], ax
     ; advance source LBA and remaining count
     mov ax, [run_len]
     add [cur_lba], ax

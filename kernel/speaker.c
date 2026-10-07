@@ -17,14 +17,15 @@
  * Before each write the Input Buffer Full status (port 0x41 bit 1) must be 0.
  * While a tone is playing the 8741 does not poll, so a command written then
  * stays latched in IBF until the tone finishes. We must therefore NEVER block
- * on IBF from the timer ISR; we only write when IBF is already clear and skip
- * otherwise (the same approach Hoppler's SndPump uses).
+ * on IBF from the timer ISR; we only start a command when IBF is already clear,
+ * and otherwise queue the tone (one deep) and retry it on the next timer tick
+ * (the same approach Hoppler's SndPump uses).
  *
  * GentleOS's engine calls krn_speaker_set_freq() on every note change and holds
- * the tone by leaving the frequency set. We map that onto the 8741 by issuing a
- * TONE command whose length comfortably outlasts one note step; the engine
- * re-issues it on the next note. A rest/stop issues nothing (the previous tone
- * simply decays).
+ * the tone by leaving the frequency set. The 8741 instead needs the length up
+ * front, so each song note is sent with its own duration; an open-ended tone
+ * (a piano key) gets one short stroke. A rest or stop sends nothing - the
+ * current tone simply ends.
  */
 
 #include <kernel.h>
@@ -38,11 +39,10 @@ enum {
 };
 
 /*
- * Tone length written to the 8741, in ~20 ms units (+0x1F bias applied below).
- * The default timer tick is 10 ms, so a few units outlast one or two note
- * steps; the engine refreshes it on each note. Kept short so a held "note"
- * (e.g. a piano key struck on the DMV, which has no key-up) is a clean, finite
- * stroke rather than a drone.
+ * Length of an open-ended tone (ticks == 0xffff, e.g. a piano key struck on the
+ * DMV, which has no key-up), in ~20 ms units (+0x1F bias applied below). Kept
+ * short so it is a clean, finite stroke rather than a drone. Song notes use
+ * their own duration instead.
  */
 #define DMV_TONE_UNITS 12   /* ~240 ms */
 
@@ -93,17 +93,121 @@ krn_speaker_hz_to_tone(uint16_t hz)
 }
 
 /*
- * Non-blocking 8741 tone write. Returns without doing anything if the input
- * buffer is still full (a previous tone/command is in flight) - safe to call
- * from the timer ISR. hz == 0 is a rest: nothing is written (the current tone
- * finishes on its own), which is what the engine wants between notes.
+ * Tone transmission - a small non-blocking state machine, the protocol
+ * Hoppler's SndPump uses on real hardware.
+ *
+ * The 8741 TONE command is three bytes: 0x06 to the command port, then the
+ * pitch and length bytes to the data port. Two facts make this delicate:
+ *
+ *  - While the 8741 plays a tone it does not read its input buffer at all, yet
+ *    IBF (status bit 1) is already 0 again. A byte written then is latched and
+ *    only consumed when the tone has ended. Writing several bytes in a row at
+ *    that time overwrites the latch - the 8741 then sees a command without its
+ *    data and waits for a data byte forever, keyboard included.
+ *  - Once the 8741 has taken the 0x06 it sits in its TONE routine and actively
+ *    waits for the two data bytes; it reads each one at once.
+ *
+ * So: when IBF is 0, write only 0x06 (state CMD_SENT). When IBF is 0 again,
+ * the 8741 has taken the command and is waiting for data - write pitch and
+ * length back to back. A command once started is always completed (as a pause
+ * if the queued tone was cancelled meanwhile). krn_speaker_pump() never waits
+ * longer than the few loops the 8741 needs between the two data bytes, so it
+ * is safe in the timer ISR; it runs on every timer tick.
+ */
+enum {
+    SND_IDLE = 0,
+    SND_CMD_SENT = 1,
+};
+
+static int snd_state = SND_IDLE;
+
+/* One-deep queue: the tone to send next (newest request wins). */
+static int pending_tone;
+static uint8_t pending_n;
+static uint8_t pending_units;
+
+static int
+krn_speaker_ibf(void)
+{
+    return (krn_inb(KBD_CMD) & KBD_IBF) != 0;
+}
+
+static void
+krn_speaker_pump(void)
+{
+    uint8_t pitch, len;
+    int guard;
+
+    if (snd_state == SND_IDLE) {
+        if (!pending_tone || krn_speaker_ibf()) {
+            return;
+        }
+        krn_outb(SND_CMD_TONE, KBD_CMD);
+        snd_state = SND_CMD_SENT;
+        return;
+    }
+
+    /* SND_CMD_SENT: wait until the 8741 has taken the command byte */
+    if (krn_speaker_ibf()) {
+        return;
+    }
+
+    if (pending_tone) {
+        pitch = (uint8_t)(pending_n + 0x20);
+        len = (uint8_t)(pending_units + 0x1F);
+    } else {
+        pitch = 0x20;           /* n = 0: pause */
+        len = 1 + 0x1F;         /* shortest length */
+    }
+    pending_tone = 0;
+    snd_state = SND_IDLE;
+
+    krn_outb(pitch, KBD_DATA);
+    /* the 8741 is actively waiting now and reads the byte within microseconds */
+    guard = 0x4000;
+    while (krn_speaker_ibf() && --guard)
+        ;
+    krn_outb(len, KBD_DATA);
+}
+
+/* Queue a tone and push it out as far as the 8741 allows right now. */
+static void
+krn_speaker_send(uint8_t n, uint8_t units)
+{
+    pending_tone = 1;
+    pending_n = n;
+    pending_units = units;
+
+    krn_speaker_pump();
+    krn_speaker_pump();     /* second step, if the command was taken at once */
+}
+
+/*
+ * Start a tone of `hz` lasting `ticks` timer ticks (10 ms each on the DMV).
+ * The 8741 plays tones of a fixed length by itself, so the length is sent up
+ * front: a song note gets its own duration (a hair shorter, so the 8741 is
+ * free again when the next note is due); an open-ended tone (ticks == 0xffff,
+ * e.g. a piano key - the DMV keyboard has no key-up) gets one short stroke.
+ * REST_PITCH is a rest (drops a queued tone), 0 means stop; neither sends
+ * anything - the current tone simply ends.
  */
 static void
-krn_speaker_set_freq(uint16_t hz)
+krn_speaker_set_freq(uint16_t hz, uint16_t ticks)
 {
     uint8_t n;
+    uint16_t units;
 
-    if (hz == 0 || hz == REST_PITCH) {
+    if (hz == REST_PITCH) {
+        /* a rest inside a song: a late queued note must not sound into it */
+        pending_tone = 0;
+        return;
+    }
+    if (hz == 0) {
+        /*
+         * stop / end of song: leave a queued tone alone. On the DMV every key
+         * press is followed at once by a synthesized key-up, and the piano
+         * stops on key-up - clearing here would drop the tone just queued.
+         */
         return;
     }
 
@@ -112,21 +216,17 @@ krn_speaker_set_freq(uint16_t hz)
         return;
     }
 
-    /* Only issue the command if the 8741 can accept it right now. */
-    if (krn_inb(KBD_CMD) & KBD_IBF) {
-        return;
+    if (ticks == 0xffff) {
+        units = DMV_TONE_UNITS;
+    } else {
+        /* 1 unit = 20.48 ms = ~2 ticks; length byte max 0xFF = 224 units */
+        units = (ticks > 2) ? (uint16_t)((ticks - 1) / 2) : 1;
+        if (units > 224) {
+            units = 224;
+        }
     }
-    krn_outb(SND_CMD_TONE, KBD_CMD);
 
-    if (krn_inb(KBD_CMD) & KBD_IBF) {
-        return;
-    }
-    krn_outb((uint8_t)(n + 0x20), KBD_DATA);           /* pitch byte  */
-
-    if (krn_inb(KBD_CMD) & KBD_IBF) {
-        return;
-    }
-    krn_outb((uint8_t)(DMV_TONE_UNITS + 0x1F), KBD_DATA); /* length byte */
+    krn_speaker_send(n, (uint8_t)units);
 }
 
 /* Must be called while locked or in interrupt context */
@@ -139,13 +239,13 @@ krn_speaker_start_note(void)
         /* Keep song, owner and elapsed time for inspection */
         krn_speaker_state.state = SPEAKER_STATE_STOPPED;
         krn_speaker_state.note = NULL;
-        krn_speaker_set_freq(0);
+        krn_speaker_set_freq(0, 0);
         return;
     }
 
     krn_speaker_state.note_ticks_left = note->ticks;
 
-    krn_speaker_set_freq(note->pitch ? note->pitch : REST_PITCH);
+    krn_speaker_set_freq(note->pitch ? note->pitch : REST_PITCH, note->ticks);
 }
 
 global void
@@ -210,7 +310,7 @@ krn_speaker_pause(void *owner)
 
     if (krn_speaker_state.state == SPEAKER_STATE_PLAYING) {
         krn_speaker_state.state = SPEAKER_STATE_PAUSED;
-        krn_speaker_set_freq(REST_PITCH);
+        krn_speaker_set_freq(REST_PITCH, 0);
     }
 
     krn_unlock(lock);
@@ -232,7 +332,8 @@ krn_speaker_resume(void *owner)
         krn_speaker_state.state = SPEAKER_STATE_PLAYING;
 
         krn_speaker_set_freq(krn_speaker_state.note->pitch
-            ? krn_speaker_state.note->pitch : REST_PITCH);
+            ? krn_speaker_state.note->pitch : REST_PITCH,
+            krn_speaker_state.note_ticks_left);
     }
 
     krn_unlock(lock);
@@ -256,15 +357,18 @@ krn_speaker_stop(void *owner)
     krn_speaker_state.song_elapsed_ticks = 0;
     krn_speaker_state.note = NULL;
     krn_speaker_state.note_ticks_left = 0;
-    krn_speaker_set_freq(0);
+    krn_speaker_set_freq(0, 0);
 
     krn_unlock(lock);
 }
 
-/* Must be called in interrupt context */
+/* Must be called in interrupt context (or, on a K230, from the timer poll) */
 global void
 krn_speaker_on_tick(void)
 {
+    /* advance a tone the busy 8741 could not take yet */
+    krn_speaker_pump();
+
     if (krn_speaker_state.state != SPEAKER_STATE_PLAYING) {
         return;
     }
