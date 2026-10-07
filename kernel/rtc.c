@@ -33,13 +33,22 @@ krn_rtc_init(void)
     int avail;
     time_st t;
 
-    krn_debug_printf("Reading clock from %s... ", krn_is_dos() ? "DOS" : "BIOS");
+    krn_debug_printf("Reading clock from %s... ",
+        krn_is_dos() ? "DOS" : "default");
 
     if (krn_is_dos()) {
         krn_rtc_get_dos_time(&t);
         avail = 1;
     } else {
-        avail = krn_bios_get_time(&t);
+        /*
+         * Native DMV boot: there is no PC BIOS INT 1Ah, and the mono machine
+         * has no RTC at all. Do not probe hardware (an INT 1Ah here would hit
+         * the IRET trap and return garbage); fall through to the default time.
+         * GentleOS keeps its own in-memory clock while running, which the Setup
+         * app can set - it never writes any hardware RTC (matching upstream and
+         * avoiding the DOS date-encoding clash).
+         */
+        avail = 0;
     }
 
     if (avail && t.year > 2000) {

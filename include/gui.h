@@ -94,11 +94,30 @@ enum {
 };
 
 enum {
-    GUI_WIDTH = 320,
-    GUI_HEIGHT = 200,
-    GUI_FB_PITCH = GUI_WIDTH / 8,
-    GUI_FB_PLANE_SIZE = GUI_HEIGHT * GUI_FB_PITCH,
-    GUI_VRAM_PITCH = GUI_WIDTH / 4,
+    /*
+     * NCR Decision Mate V: the uPD7220 GDC drives 640x400. The GUI backbuffer
+     * is a plain 1bpp bitmap (one bit per pixel, MSB = leftmost), pushed to the
+     * GDC's private video RAM by the flush in gui/surface.c. There is no PC-style
+     * CGA/VGA framebuffer in the CPU's address space.
+     */
+    GUI_WIDTH = 640,
+    GUI_HEIGHT = 400,
+    GUI_FB_PITCH = GUI_WIDTH / 8,                  /* 80 bytes / line (mono backbuffer) */
+    GUI_FB_PLANE_SIZE = GUI_HEIGHT * GUI_FB_PITCH, /* 32000 bytes */
+
+    /*
+     * On the DMV the framebuffer is not a linear PC-style region. The uPD7220
+     * owns its video RAM in its own address space and the CPU can only reach it
+     * through the command/parameter registers (ports 0xA0/0xA1). One display
+     * word = 16 horizontal pixels, so a scanline is GUI_WIDTH/16 words.
+     */
+    GUI_VRAM_WORDS_PER_LINE = GUI_WIDTH / 16,   /* 40 words / line */
+    GUI_VRAM_PLANE_WORDS = 0x4000,              /* per-plane stride in 7220 word space */
+
+    /* Word offsets of the three colour planes in the 7220 address space. */
+    GDC_PLANE_BASE_GREEN = 0x0000,
+    GDC_PLANE_BASE_RED   = 0x4000,
+    GDC_PLANE_BASE_BLUE  = 0x8000,
 };
 
 #define GRID_WIDTH_SPACED(cell_width, cols) ((cell_width) * (cols) + (cols) - 1)

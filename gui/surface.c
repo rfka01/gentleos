@@ -14,26 +14,38 @@ enum {
 static uint8_t far *gui_surface_pixels;
 static rect_st gui_surface_dirty_rects[DIRTY_RECTS_MAX];
 static int gui_surface_dirty_rects_count = 0;
-static uint16_t gui_surface_byte_expansions[256];
+
+/*
+ * Bit-reversal lookup. The 1bpp backbuffer stores pixels MSB-first (bit 7 =
+ * leftmost), but a uPD7220 display word has the LSB as the leftmost pixel, so
+ * each backbuffer byte is bit-reversed before being packed into a GDC word.
+ */
+static uint8_t gui_bitrev[256];
+static int gui_bitrev_ready = 0;
+
+static void
+gui_build_bitrev(void)
+{
+    int i, b, r;
+
+    for (i = 0; i < 256; ++i) {
+        r = 0;
+        for (b = 0; b < 8; ++b) {
+            if (i & (1 << b)) {
+                r |= (1 << (7 - b));
+            }
+        }
+        gui_bitrev[i] = (uint8_t)r;
+    }
+
+    gui_bitrev_ready = 1;
+}
 
 global void
 gui_surface_init(void)
 {
-    int i;
-
     gui_surface_pixels = heap_alloc(GUI_FB_PLANE_SIZE);
-
-    for (i = 0; i < 256; ++i) {
-        gui_surface_byte_expansions[i] =
-            (0x00C0 * !!(i & 0x80)) |
-            (0x0030 * !!(i & 0x40)) |
-            (0x000C * !!(i & 0x20)) |
-            (0x0003 * !!(i & 0x10)) |
-            (0xC000 * !!(i & 0x08)) |
-            (0x3000 * !!(i & 0x04)) |
-            (0x0C00 * !!(i & 0x02)) |
-            (0x0300 * !!(i & 0x01));
-    }
+    gui_build_bitrev();
 }
 
 global void
@@ -115,29 +127,137 @@ gui_surface_mark_dirty(const point_st *origin, const rect_st *rect)
     gui_rect_copy(&gui_surface_dirty_rects[gui_surface_dirty_rects_count++], &final_rect);
 }
 
+/* ---- uPD7220 access used by the flush ---------------------------------- */
+
+static void
+gdc_wait_fifo_local(void)
+{
+    int guard = 0x4000;
+    while ((krn_inb(0xA0) & 0x02 /* FIFO full */) && --guard)
+        ;
+}
+
+static void
+gdc_cmd_local(uint8_t c)
+{
+    gdc_wait_fifo_local();
+    krn_outb(c, 0xA1);
+}
+
+static void
+gdc_par_local(uint8_t p)
+{
+    gdc_wait_fifo_local();
+    krn_outb(p, 0xA0);
+}
+
+static void
+gdc_pos(uint32_t word_addr)
+{
+    gdc_cmd_local(0x49);   /* CURS: set EAD */
+    gdc_par_local((uint8_t)(word_addr & 0xFF));
+    gdc_par_local((uint8_t)((word_addr >> 8) & 0xFF));
+    gdc_par_local((uint8_t)((word_addr >> 16) & 0x03));
+}
+
+/*
+ * Flush one dirty rectangle to whichever colour planes are selected by the
+ * current theme fg/bg plane masks. For each scanline we pack the run of
+ * 16-pixel display words the rect touches from the mono backbuffer
+ * (bit-reversed) and stream them to each plane.
+ *
+ * A "constant" plane (fg and bg agree there) is one repeated word via FIGS
+ * DC=span-1; a plane where fg and bg differ streams the packed (optionally
+ * inverted) words with FIGS DC=0, DIR=2. MASK is set to 0xFFFF per plane.
+ */
 static void
 gui_surface_flush_rect(const rect_st *rect)
 {
-    int x0, x1, src_word_x, src_words, vram_word_x, y, i;
-    uint8_t far *vram = MK_FP(0xb800, 0);
-    uint16_t far *src;
-    uint16_t far *dst;
-    uint16_t pair;
+    int x0, x1, src_word_x, src_words, y, i, p;
+    uint8_t far *row;
+    uint16_t words[GUI_VRAM_WORDS_PER_LINE];
+    static const uint32_t plane_base[3] = {
+        GDC_PLANE_BASE_GREEN, GDC_PLANE_BASE_RED, GDC_PLANE_BASE_BLUE
+    };
 
+    if (!gui_bitrev_ready) {
+        gui_build_bitrev();
+    }
+
+    /* Word-align the horizontal span (16 px per display word). */
     x0 = (rect->x / 16) * 16;
     x1 = ((rect->x + rect->width + 15) / 16) * 16;
+    if (x1 > GUI_WIDTH) {
+        x1 = GUI_WIDTH;
+    }
     src_word_x = x0 / 16;
     src_words = (x1 - x0) / 16;
-    vram_word_x = x0 / 8;
+    if (src_words <= 0) {
+        return;
+    }
 
     for (y = rect->y; y < rect->y + rect->height; ++y) {
-        src = (uint16_t far *)(gui_surface_pixels + y * GUI_FB_PITCH) + src_word_x;
-        dst = (uint16_t far *)(vram + (y % 2) * 0x2000 + (y / 2) * GUI_VRAM_PITCH) + vram_word_x;
+        /* Two source bytes per display word; low byte = left 8 pixels. */
+        row = gui_surface_pixels + (uint16_t)y * GUI_FB_PITCH + src_word_x * 2;
 
         for (i = 0; i < src_words; ++i) {
-            pair = src[i];
-            dst[i * 2] = gui_surface_byte_expansions[pair & 0xFF];
-            dst[i * 2 + 1] = gui_surface_byte_expansions[pair >> 8];
+            uint8_t lo = gui_bitrev[row[i * 2 + 0]];
+            uint8_t hi = gui_bitrev[row[i * 2 + 1]];
+            words[i] = (uint16_t)lo | ((uint16_t)hi << 8);
+        }
+
+        for (p = 0; p < 3; ++p) {
+            uint32_t base;
+            int fg_here = (krn_gdc_fg_mask >> p) & 1;
+            int bg_here = (krn_gdc_bg_mask >> p) & 1;
+
+            base = plane_base[p]
+                 + (uint16_t)((uint16_t)y * GUI_VRAM_WORDS_PER_LINE
+                              + (uint16_t)src_word_x);
+
+            gdc_pos(base);
+
+            if (fg_here == bg_here) {
+                /*
+                 * Plane is the same for foreground and background pixels, so
+                 * every pixel in this plane is a constant: one WDAT fill
+                 * (DIR=2, DC=span-1, single repeated data word).
+                 */
+                uint16_t fill = fg_here ? 0xFFFF : 0x0000;
+
+                gdc_cmd_local(0x4A);        /* MASK = all bits */
+                gdc_par_local(0xFF);
+                gdc_par_local(0xFF);
+                gdc_cmd_local(0x4C);        /* FIGS: DIR=2, DC=span-1 */
+                gdc_par_local(0x02);
+                gdc_par_local((uint8_t)((src_words - 1) & 0xFF));
+                gdc_par_local((uint8_t)(((src_words - 1) >> 8) & 0x3F));
+                gdc_cmd_local(0x20);        /* WDAT word, replace */
+                gdc_par_local((uint8_t)(fill & 0xFF));
+                gdc_par_local((uint8_t)(fill >> 8));
+                continue;
+            }
+
+            /*
+             * Foreground and background differ in this plane, so the plane's
+             * bits follow the pixel bitmap. Since exactly one of fg_here/bg_here
+             * is set, the per-word value is the bitmap (fg_here) or its
+             * complement (bg_here). Stream the distinct words with FIGS DC=0,
+             * DIR=2: the first WDAT writes at EAD then auto-advances +1 word.
+             */
+            gdc_cmd_local(0x4A);            /* MASK = all bits */
+            gdc_par_local(0xFF);
+            gdc_par_local(0xFF);
+            gdc_cmd_local(0x4C);            /* FIGS: DIR=2 (+X word), DC=0 */
+            gdc_par_local(0x02);
+            gdc_par_local(0x00);
+            gdc_par_local(0x00);
+            gdc_cmd_local(0x20);           /* WDAT word, replace */
+            for (i = 0; i < src_words; ++i) {
+                uint16_t w = fg_here ? words[i] : (uint16_t)~words[i];
+                gdc_par_local((uint8_t)(w & 0xFF));
+                gdc_par_local((uint8_t)(w >> 8));
+            }
         }
     }
 }
