@@ -4,6 +4,7 @@ extern void krn_bios_puts(const char *s);
 extern uint16_t krn_bios_getc(void);
 extern uint16_t krn_bios_get_key(void);
 extern int krn_bios_get_time(time_st *t);
+extern uint16_t krn_dmv_get_key(void);
 extern void krn_bios_uart_init(void);
 extern void krn_bios_uart_putc(char c);
 extern void krn_bios_uart_puts(const char *s);
@@ -28,6 +29,8 @@ extern volatile int krn_keyboard_use_bios;
 extern uint16_t krn_keyboard_getc(void);
 extern void krn_keyboard_handle_intr(void);
 extern void krn_keyboard_handle_bios(void);
+extern int krn_keyboard_country;
+extern uint8_t krn_keyboard_position(uint8_t code);
 extern void krn_keyboard_init(void);
 extern void krn_keyboard_deinit(void);
 /* kernel/lock.c */
@@ -57,6 +60,9 @@ extern void krn_speaker_on_tick(void);
 extern void krn_speaker_deinit(void);
 /* kernel/timer.c */
 extern void krn_timer_handle_intr(void);
+extern void krn_timer_poll(void);
+extern void krn_timer_idle(void);
+extern int krn_timer_is_polled(void);
 extern uint32_t krn_timer_get_msecs(void);
 extern uint16_t krn_timer_get_counter_0(void);
 extern void krn_timer_set_frequency(uint16_t hz);
@@ -66,6 +72,11 @@ extern void krn_timer_deinit(void);
 /* kernel/vga.c */
 extern const vga_theme_st krn_vga_themes[VGA_THEME_COUNT];
 extern int krn_vga_current_theme;
+extern uint8_t krn_gdc_fg_mask;
+extern uint8_t krn_gdc_bg_mask;
+extern int krn_vga_is_mono(void);
+extern void krn_vga_debug_mark(int row);
 extern void krn_vga_set_theme(int n);
 extern void krn_vga_init(void);
 extern void krn_vga_deinit(void);
+extern void krn_vga_clear_vram(void);
