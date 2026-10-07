@@ -58,6 +58,9 @@ extern void krn_speaker_on_tick(void);
 extern void krn_speaker_deinit(void);
 /* kernel/timer.c */
 extern void krn_timer_handle_intr(void);
+extern void krn_timer_poll(void);
+extern void krn_timer_idle(void);
+extern int krn_timer_is_polled(void);
 extern uint32_t krn_timer_get_msecs(void);
 extern uint16_t krn_timer_get_counter_0(void);
 extern void krn_timer_set_frequency(uint16_t hz);

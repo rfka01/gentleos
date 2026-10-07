@@ -87,18 +87,23 @@ krn_main(void)
     krn_timer_init();
 
     /*
-     * The IVT is valid and the DMV timer ISR is installed, so interrupts are
-     * safe to enable. The event loop and sleep() now wake on real timer ticks
-     * (via krn_cpu_hlt), instead of busy-polling.
+     * Interrupts: krn_timer_init() has already enabled them on a CPU card with
+     * an interrupt controller (K235) and left them off on a K230, where the
+     * timer is polled instead.
      */
-    if (native) {
-        krn_cpu_sti();
-    }
 
     krn_rtc_init();
 
     krn_debug_printf("Starting GUI...\n");
-    sleep(2000);
+
+    /*
+     * Upstream pauses 2 s so the boot messages can be read before the GUI
+     * takes over the screen. On a native DMV boot there is no text console
+     * (no BIOS), so there is nothing to read - skip the wait.
+     */
+    if (!native) {
+        sleep(2000);
+    }
 
     krn_vga_init();
     gui_main();
