@@ -10,7 +10,8 @@
 #   sectors 1..     GT16.COM (kernel)   -> 0x1000:0x0100
 #   sectors ..end   GT16.DAT (initrd)   -> 0x3000:0x0000
 #
-# Output: GT16DMV72.IMG (720 KB) and GT16DMV.IMG (exact size).
+# Output: GT16DMV.IMG (360 KB, the real DMV floppy geometry: 40 tracks x
+# 2 heads x 9 sectors x 512 B).
 #
 # The DOS .com build and its PC-style images are produced by the normal
 # tools/mkdisks.pl; this script only adds the native image.
@@ -31,4 +32,4 @@ nasm -f bin -o build/boot_dmv/bootdmv.bin boot_dmv/bootdmv.s
 echo "Building native disk image(s)..."
 perl tools/mkdisks_dmv.pl
 
-echo "Done. Native images: GT16DMV72.IMG, GT16DMV.IMG"
+echo "Done. Native image: GT16DMV.IMG (360 KB)"

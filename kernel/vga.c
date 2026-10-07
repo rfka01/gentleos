@@ -255,6 +255,15 @@ krn_vga_set_theme(int n)
 
     krn_vga_current_theme = n;
 
+    /*
+     * Clear all planes before the repaint. The flush skips planes the theme no
+     * longer uses, so a plane that WAS lit under the old theme (e.g. red/blue
+     * under White/Black) must be wiped here, or it would keep showing the old
+     * image as a colour ghost. The full repaint below then redraws the content
+     * into the new theme's planes.
+     */
+    krn_vga_clear_vram();
+
     /* Force a full repaint so existing content moves to the new plane(s). */
     gui_surface_mark_dirty(&GUI_POINT_ZERO, &GUI_RECT_SCREEN);
 

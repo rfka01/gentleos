@@ -45,7 +45,7 @@ What the port changes vs. upstream (all documented in
 Build `GT16.COM` and `GT16.DAT` with the normal toolchain (below), then:
 
 ```sh
-sh tools/mkdmv.sh        # -> GT16DMV72.IMG (native, no-DOS floppy)
+sh tools/mkdmv.sh        # -> GT16DMV.IMG (native, no-DOS 360K floppy)
 ```
 
 The standard `wmake` build already produces the PC images, and `GT16.COM`
