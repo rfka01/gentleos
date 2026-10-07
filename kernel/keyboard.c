@@ -142,12 +142,84 @@ krn_keyboard_handle_bios(void)
     }
 }
 
+/*
+ * DMV keyboard language code (the DIP switches under the keyboard), 0..7, or
+ * -1 if the keyboard controller did not answer. For the version-1 keyboards
+ * (NCR system manual, fig. 2.22): 0 US, 1 UK/Int., 2 Danish, 3 German,
+ * 4 Swedish/Finnish, 5 Norwegian, 6 Spanish, 7 Italian.
+ */
+global int krn_keyboard_country = -1;
+
+/*
+ * Ask the mainboard 8741 for the language code: command 01h on port 41h. It
+ * answers with a byte on port 40h while setting status bit 7 (the "this is the
+ * country code" flag, KBD_LANG_VAR in the NCR BIOS); the byte is E8h + code.
+ * A keystroke that happens to arrive first (bit 7 clear) is discarded. Bounded
+ * waits - a missing or busy controller just leaves the code unknown.
+ */
+static void
+krn_keyboard_detect_country(void)
+{
+    krn_lock_t lock = krn_lock();
+    long guard;
+    uint8_t st;
+
+    for (guard = 20000L; (krn_inb(0x41) & 0x02) && guard; --guard)
+        ;
+    if (!guard) {
+        krn_unlock(lock);
+        return;
+    }
+
+    krn_outb(0x01, 0x41);
+
+    for (guard = 200000L; guard; --guard) {
+        st = krn_inb(0x41);
+        if (!(st & 0x01)) {
+            continue;
+        }
+        if (st & 0x80) {
+            krn_keyboard_country = krn_inb(0x40) & 0x07;
+            break;
+        }
+        (void)krn_inb(0x40);    /* an early keystroke, not the answer */
+    }
+
+    krn_unlock(lock);
+}
+
+/*
+ * Map a key code (which names the key's LABEL - the DMV keyboard sends the
+ * character printed on the key) to the code of the key at that PHYSICAL
+ * position on a US keyboard. Apps that use the keyboard as a layout rather
+ * than as letters - the Sounds piano - want positions: on a German QWERTZ
+ * keyboard the key labelled Y sits where the US Z is.
+ */
+global uint8_t
+krn_keyboard_position(uint8_t code)
+{
+    switch (krn_keyboard_country) {
+    case 3: /* German, QWERTZ: Y and Z swapped */
+        if (code == KEY_Y) return KEY_Z;
+        if (code == KEY_Z) return KEY_Y;
+        break;
+    case 7: /* Italian, QZERTY: W and Z swapped */
+        if (code == KEY_W) return KEY_Z;
+        if (code == KEY_Z) return KEY_W;
+        break;
+    }
+
+    return code;
+}
+
 global void
 krn_keyboard_init(void)
 {
     system_info_st *si = &system_info;
 
     krn_debug_printf("Initializing keyboard... ");
+
+    krn_keyboard_detect_country();
 
     /*
      * The DMV has no PC-style 8042/PS-2 controller and no INT 09h. Hooking
@@ -160,7 +232,7 @@ krn_keyboard_init(void)
      */
     (void)si;
 
-    krn_debug_printf("ok\n");
+    krn_debug_printf("ok (country %d)\n", krn_keyboard_country);
 }
 
 global void

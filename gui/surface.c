@@ -152,58 +152,56 @@ gdc_par_local(uint8_t p)
 }
 
 /*
- * Fast parameter write for long WDAT bursts. The uPD7220 parameter FIFO is 16
- * bytes deep, so instead of polling the "FIFO full" status before every single
- * byte (the old per-byte gdc_par_local), we poll only once per block of 8 and
- * then push 8 bytes back-to-back. That stays safely under the 16-byte depth
- * while cutting the number of status INs - the dominant cost of the flush - by
- * ~8x. Call gdc_par_fast_begin() before a burst and gdc_par_fast() per byte.
+ * Position the write address (CURS) and open the MASK to all 16 bits. CURS also
+ * loads MASK from its dot-address field (MASK = 1 << dAD, here 0x0001), so the
+ * MASK must be set again after every CURS - otherwise a word write only touches
+ * its leftmost pixel.
  */
-static int gdc_fast_budget;
-
-static void
-gdc_par_fast_begin(void)
-{
-    gdc_fast_budget = 0;
-}
-
-static void
-gdc_par_fast(uint8_t p)
-{
-    if (gdc_fast_budget == 0) {
-        gdc_wait_fifo_local();
-        gdc_fast_budget = 8;
-    }
-    krn_outb(p, 0xA0);
-    --gdc_fast_budget;
-}
-
 static void
 gdc_pos(uint32_t word_addr)
 {
-    gdc_cmd_local(0x49);   /* CURS: set EAD */
+    gdc_cmd_local(0x49);   /* CURS: set EAD (and MASK = 1 << dAD) */
     gdc_par_local((uint8_t)(word_addr & 0xFF));
     gdc_par_local((uint8_t)((word_addr >> 8) & 0xFF));
     gdc_par_local((uint8_t)((word_addr >> 16) & 0x03));
+    gdc_cmd_local(0x4A);   /* MASK = all bits */
+    gdc_par_local(0xFF);
+    gdc_par_local(0xFF);
+}
+
+/* FIGS: direction +X word, DC = count-1 (14 bits) */
+static void
+gdc_figs(uint16_t dc)
+{
+    gdc_cmd_local(0x4C);
+    gdc_par_local(0x02);
+    gdc_par_local((uint8_t)(dc & 0xFF));
+    gdc_par_local((uint8_t)((dc >> 8) & 0x3F));
 }
 
 /*
  * Flush one dirty rectangle to whichever colour planes are selected by the
- * current theme fg/bg plane masks. For each scanline we pack the run of
- * 16-pixel display words the rect touches from the mono backbuffer
- * (bit-reversed) and stream them to each plane.
+ * current theme fg/bg plane masks.
  *
- * A "constant" plane (fg and bg agree there) is one repeated word via FIGS
- * DC=span-1; a plane where fg and bg differ streams the packed (optionally
- * inverted) words with FIGS DC=0, DIR=2. MASK is set to 0xFFFF per plane.
+ * Plane by plane (every CURS re-opens the MASK, see gdc_pos()):
+ *  - A "constant" plane (fg and bg agree there) is filled with one repeated
+ *    word: FIGS DC=span-1 and a single WDAT data word.
+ *  - A plane where fg and bg differ follows the pixel bitmap (inverted when
+ *    the plane belongs to the background colour). FIGS DC=0 is set once; then
+ *    per line CURS + WDAT and the line's bytes go out through krn_gdc_stream()
+ *    (kernel/gdc.s), the assembler loop that bit-reverses, inverts and writes
+ *    them - the per-byte C path was what made the flush slow.
+ *
+ * A rectangle that spans the full width is contiguous in both the backbuffer
+ * (80 bytes per line) and VRAM (40 words per line), so it goes out as ONE
+ * burst: one CURS, one WDAT (or one fill), all lines in a row.
  */
 static void
 gui_surface_flush_rect(const rect_st *rect)
 {
-    int x0, x1, src_word_x, src_words, y, i, p;
-    uint8_t far *row;
+    int x0, x1, src_word_x, src_words, y, p;
+    int full_width;
     uint8_t used_planes;
-    uint16_t words[GUI_VRAM_WORDS_PER_LINE];
     static const uint32_t plane_base[3] = {
         GDC_PLANE_BASE_GREEN, GDC_PLANE_BASE_RED, GDC_PLANE_BASE_BLUE
     };
@@ -220,9 +218,10 @@ gui_surface_flush_rect(const rect_st *rect)
     }
     src_word_x = x0 / 16;
     src_words = (x1 - x0) / 16;
-    if (src_words <= 0) {
+    if (src_words <= 0 || rect->height <= 0) {
         return;
     }
+    full_width = (src_words == GUI_VRAM_WORDS_PER_LINE);
 
     /*
      * Only touch planes the current theme actually uses (a bit set in fg or bg
@@ -230,82 +229,64 @@ gui_surface_flush_rect(const rect_st *rect)
      * constant black, and krn_vga_clear_vram() / a theme change already leaves
      * it black, so writing it every flush is pure waste. For the default
      * Green/Black theme (and every single-colour theme, and the whole mono
-     * machine) this cuts the per-scanline work from three planes to one.
+     * machine) this cuts the work from three planes to one.
      */
     used_planes = (uint8_t)((krn_gdc_fg_mask | krn_gdc_bg_mask) & 0x07);
     if (used_planes == 0) {
         used_planes = 0x01;   /* degenerate all-black theme: keep green live */
     }
 
-    for (y = rect->y; y < rect->y + rect->height; ++y) {
-        /* Two source bytes per display word; low byte = left 8 pixels. */
-        row = gui_surface_pixels + (uint16_t)y * GUI_FB_PITCH + src_word_x * 2;
+    for (p = 0; p < 3; ++p) {
+        int fg_here = (krn_gdc_fg_mask >> p) & 1;
+        int bg_here = (krn_gdc_bg_mask >> p) & 1;
 
-        for (i = 0; i < src_words; ++i) {
-            uint8_t lo = gui_bitrev[row[i * 2 + 0]];
-            uint8_t hi = gui_bitrev[row[i * 2 + 1]];
-            words[i] = (uint16_t)lo | ((uint16_t)hi << 8);
+        if (!((used_planes >> p) & 1)) {
+            continue;   /* plane stays constant black - skip entirely */
         }
 
-        for (p = 0; p < 3; ++p) {
-            uint32_t base;
-            int fg_here = (krn_gdc_fg_mask >> p) & 1;
-            int bg_here = (krn_gdc_bg_mask >> p) & 1;
+        if (fg_here == bg_here) {
+            uint8_t fill = fg_here ? 0xFF : 0x00;
 
-            if (!((used_planes >> p) & 1)) {
-                continue;   /* plane stays constant black - skip entirely */
-            }
-
-            base = plane_base[p]
-                 + (uint16_t)((uint16_t)y * GUI_VRAM_WORDS_PER_LINE
-                              + (uint16_t)src_word_x);
-
-            gdc_pos(base);
-
-            if (fg_here == bg_here) {
-                /*
-                 * Plane is the same for foreground and background pixels, so
-                 * every pixel in this plane is a constant: one WDAT fill
-                 * (DIR=2, DC=span-1, single repeated data word).
-                 */
-                uint16_t fill = fg_here ? 0xFFFF : 0x0000;
-
-                gdc_cmd_local(0x4A);        /* MASK = all bits */
-                gdc_par_local(0xFF);
-                gdc_par_local(0xFF);
-                gdc_cmd_local(0x4C);        /* FIGS: DIR=2, DC=span-1 */
-                gdc_par_local(0x02);
-                gdc_par_local((uint8_t)((src_words - 1) & 0xFF));
-                gdc_par_local((uint8_t)(((src_words - 1) >> 8) & 0x3F));
-                gdc_cmd_local(0x20);        /* WDAT word, replace */
-                gdc_par_local((uint8_t)(fill & 0xFF));
-                gdc_par_local((uint8_t)(fill >> 8));
+            if (full_width) {
+                /* whole rect in one fill (<= 400*40 = 16000 words < 2^14) */
+                gdc_pos(plane_base[p] + (uint16_t)rect->y * GUI_VRAM_WORDS_PER_LINE);
+                gdc_figs((uint16_t)(rect->height * GUI_VRAM_WORDS_PER_LINE - 1));
+                gdc_cmd_local(0x20);    /* WDAT word, replace */
+                gdc_par_local(fill);
+                gdc_par_local(fill);
                 continue;
             }
 
-            /*
-             * Foreground and background differ in this plane, so the plane's
-             * bits follow the pixel bitmap. Since exactly one of fg_here/bg_here
-             * is set, the per-word value is the bitmap (fg_here) or its
-             * complement (bg_here). Stream the distinct words with FIGS DC=0,
-             * DIR=2: the first WDAT writes at EAD then auto-advances +1 word.
-             * The word stream is the hot path, so push it with the block-polled
-             * fast writer instead of polling before every byte.
-             */
-            gdc_cmd_local(0x4A);            /* MASK = all bits */
-            gdc_par_local(0xFF);
-            gdc_par_local(0xFF);
-            gdc_cmd_local(0x4C);            /* FIGS: DIR=2 (+X word), DC=0 */
-            gdc_par_local(0x02);
-            gdc_par_local(0x00);
-            gdc_par_local(0x00);
-            gdc_cmd_local(0x20);           /* WDAT word, replace */
-            gdc_par_fast_begin();
-            for (i = 0; i < src_words; ++i) {
-                uint16_t w = fg_here ? words[i] : (uint16_t)~words[i];
-                gdc_par_fast((uint8_t)(w & 0xFF));
-                gdc_par_fast((uint8_t)(w >> 8));
+            for (y = rect->y; y < rect->y + rect->height; ++y) {
+                gdc_pos(plane_base[p] + (uint16_t)y * GUI_VRAM_WORDS_PER_LINE
+                        + (uint16_t)src_word_x);
+                gdc_figs((uint16_t)(src_words - 1));
+                gdc_cmd_local(0x20);
+                gdc_par_local(fill);
+                gdc_par_local(fill);
             }
+            continue;
+        }
+
+        gdc_figs(0);                /* DC=0: each data word written once, +X */
+
+        if (full_width) {
+            gdc_pos(plane_base[p] + (uint16_t)rect->y * GUI_VRAM_WORDS_PER_LINE);
+            gdc_cmd_local(0x20);    /* WDAT word, replace */
+            krn_gdc_stream(gui_surface_pixels + (uint16_t)rect->y * GUI_FB_PITCH,
+                (uint16_t)rect->height * GUI_FB_PITCH,
+                fg_here ? 0x00 : 0xFF, gui_bitrev);
+            continue;
+        }
+
+        for (y = rect->y; y < rect->y + rect->height; ++y) {
+            gdc_pos(plane_base[p] + (uint16_t)y * GUI_VRAM_WORDS_PER_LINE
+                    + (uint16_t)src_word_x);
+            gdc_cmd_local(0x20);
+            krn_gdc_stream(gui_surface_pixels + (uint16_t)y * GUI_FB_PITCH
+                    + src_word_x * 2,
+                (uint16_t)(src_words * 2),
+                fg_here ? 0x00 : 0xFF, gui_bitrev);
         }
     }
 }

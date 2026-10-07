@@ -87,6 +87,10 @@ uint8_t krn_inb(uint16_t port);
 void krn_outb(uint8_t value, uint16_t port);
 void krn_intr(int, regs_st *);
 
+/* kernel/gdc.s */
+void krn_gdc_stream(const uint8_t far *src, uint16_t count,
+    uint16_t xor_mask, const uint8_t *bitrev);
+
 #include "p_kernel.h"
 
 #endif /* _KERNEL_H_ */
