@@ -123,7 +123,15 @@ krn_keyboard_handle_bios(void)
     event_st ev;
     key_st key;
 
-    while ((key.encoded = krn_bios_get_key()) != 0) {
+    /*
+     * Under the DMV's DOS, read keys through INT 16h. On a native (non-DOS)
+     * boot there is no BIOS, so read the DMV keyboard MCU directly (ports
+     * 0x40/0x41). Both deliver the same code set, translated to a GentleOS
+     * scan code in kernel/bios.c. Neither reports key-up, so we synthesise an
+     * immediate up event after each down.
+     */
+    while ((key.encoded = krn_is_dos() ? krn_bios_get_key()
+                                        : krn_dmv_get_key()) != 0) {
         ev.payload = key.encoded;
 
         ev.type = EVENT_KEY_DOWN;
@@ -141,8 +149,16 @@ krn_keyboard_init(void)
 
     krn_debug_printf("Initializing keyboard... ");
 
-    krn_get_isr(0x09, &saved_isr_handler);
-    krn_set_isr(0x09, si->main_segment, (uint16_t)(uint32_t)&krn_isr_keyboard);
+    /*
+     * The DMV has no PC-style 8042/PS-2 controller and no INT 09h. Hooking
+     * IRQ1 here would read the wrong hardware (ports 0x60/0x64 are not the
+     * DMV keyboard) and, on a native boot, install an ISR behind an interrupt
+     * path that is wired to the 8259 at 0x90/0x91. So we never take the PS/2
+     * IRQ route: input always comes through the poll path
+     * (krn_keyboard_handle_bios -> INT 16h under DOS, or the 8741 MCU on ports
+     * 0x40/0x41 natively). krn_keyboard_use_bios stays 1.
+     */
+    (void)si;
 
     krn_debug_printf("ok\n");
 }
@@ -150,5 +166,5 @@ krn_keyboard_init(void)
 global void
 krn_keyboard_deinit(void)
 {
-    krn_set_isr(0x09, saved_isr_handler.seg, saved_isr_handler.ofs);
+    /* No PS/2 ISR was installed; nothing to restore. */
 }

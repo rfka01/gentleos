@@ -46,7 +46,7 @@ typedef struct {
     uint16_t note_ticks_left;
 } speaker_state_st;
 
-#define VGA_THEME_COUNT 4
+#define VGA_THEME_COUNT 7
 
 typedef struct {
     uint32_t fg_color;
@@ -81,6 +81,7 @@ typedef union {
 uint16_t krn_cpu_get_flags(void);
 void krn_cpu_set_flags(uint16_t flags);
 void krn_cpu_cli(void);
+void krn_cpu_sti(void);
 void krn_cpu_hlt(void);
 uint8_t krn_inb(uint16_t port);
 void krn_outb(uint8_t value, uint16_t port);

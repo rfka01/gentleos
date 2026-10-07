@@ -126,6 +126,108 @@ krn_bios_get_time(time_st *t)
     return 1;
 }
 
+/*
+ * ---- NCR Decision Mate V native keyboard (no BIOS) ---------------------
+ *
+ * On a native (non-DOS) boot there is no INT 16h. The DMV keyboard is a
+ * separate 8741 MCU, not a PC 8042/PS-2 controller:
+ *
+ *   port 0x41 : command (write) / status (read); status bit 0 = byte ready
+ *   port 0x40 : data (read)
+ *
+ * The MCU delivers the same codes the DMV BIOS passes through: plain ASCII for
+ * printable keys, and 0x80-0x9F for special keys (Enter arrives as 0x88, the
+ * arrows as 0x82-0x85). There are no hardware shift flags, so SHIFT is inferred
+ * from the character (an upper-case letter, or a symbol only in the shifted
+ * map). We translate a DMV code into the PC-style scan code GentleOS compares
+ * against and uses to index the character map.
+ */
+
+static uint8_t
+krn_dmv_key_to_scancode(uint8_t dmv_code)
+{
+    uint8_t sc;
+
+    switch (dmv_code) {
+    case 0x84: return KEY_UP;
+    case 0x83: return KEY_DOWN;
+    case 0x82: return KEY_LEFT;
+    case 0x85: return KEY_RIGHT;
+    case 0x88: return KEY_ENTER;    /* DMV Enter = 0x88 */
+    case 0x1b: return KEY_ESC;
+    case 0x08: return KEY_BKSP;
+    case 0x09: return KEY_TAB;
+    case 0x0d: return KEY_ENTER;    /* CR, in case Enter also arrives as 0x0d */
+    case 0x20: return KEY_SPACE;
+    }
+
+    /*
+     * The DMV keyboard lacks PgUp/PgDn, which the Setup app uses for
+     * adjustments; borrow the numeric-keypad '+' and '-' for them.
+     */
+    if (dmv_code == '+') {
+        return KEY_PGUP;
+    }
+    if (dmv_code == '-') {
+        return KEY_PGDN;
+    }
+
+    /* Printable ASCII: find the scan code whose character map entry matches. */
+    for (sc = 0; sc < 90; ++sc) {
+        if (key_char_for_code(sc, 0) == (char)dmv_code) {
+            return sc;
+        }
+    }
+    for (sc = 0; sc < 90; ++sc) {
+        if (key_char_for_code(sc, KEY_MOD_SHIFT) == (char)dmv_code) {
+            return sc;
+        }
+    }
+
+    return 0;
+}
+
+static int
+krn_dmv_key_is_shifted(uint8_t dmv_code)
+{
+    uint8_t sc;
+
+    if (dmv_code >= 'A' && dmv_code <= 'Z') {
+        return 1;
+    }
+
+    for (sc = 0; sc < 90; ++sc) {
+        if (key_char_for_code(sc, 0) == (char)dmv_code) {
+            return 0;   /* present unshifted -> not a shifted-only symbol */
+        }
+    }
+    for (sc = 0; sc < 90; ++sc) {
+        if (key_char_for_code(sc, KEY_MOD_SHIFT) == (char)dmv_code) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+global uint16_t
+krn_dmv_get_key(void)
+{
+    key_st key;
+    uint8_t dmv_code;
+
+    if (!(krn_inb(0x41) & 0x01)) {
+        return 0;
+    }
+
+    dmv_code = krn_inb(0x40);
+
+    key.p.code = krn_dmv_key_to_scancode(dmv_code);
+    key.p.mods = (uint8_t)(KEY_MOD_SHIFT * (krn_dmv_key_is_shifted(dmv_code) ? 1 : 0));
+
+    return key.encoded;
+}
+
 global void
 krn_bios_uart_init(void)
 {
