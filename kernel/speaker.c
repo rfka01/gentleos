@@ -1,54 +1,132 @@
 /*
- * Copyright (c) 2026 luke8086
+ * Copyright (c) 2026 luke8086 (original), DMV port 2026
  * Distributed under the terms of GPL-2 License
  *
- * File: speaker.c - Driver for PC speaker
+ * File: speaker.c - Sound driver for the NCR Decision Mate V (8741 keyboard MCU)
+ *
+ * The DMV has no PC speaker (no PIT channel 2, no 8255 port B gate). Instead the
+ * mainboard keyboard controller (an 8741 on ports 0x40/0x41) owns the speaker
+ * and plays a single tone of a fixed length on command (hw: NCR keyboard
+ * interface listing, SOUND-GENERATOR / TONE at 0x246):
+ *
+ *   OUT 0x41, 0x06        ; TONE command
+ *   OUT 0x40, tone_byte   ; pitch:  n + 0x20, n = 1..42 (A 110 Hz .. D 1175 Hz)
+ *   OUT 0x40, len_byte    ; length: units + 0x1F, 1 unit ~= 20.48 ms
+ *                         ;   length 0 -> 256 units (~5 s): avoid
+ *
+ * Before each write the Input Buffer Full status (port 0x41 bit 1) must be 0.
+ * While a tone is playing the 8741 does not poll, so a command written then
+ * stays latched in IBF until the tone finishes. We must therefore NEVER block
+ * on IBF from the timer ISR; we only write when IBF is already clear and skip
+ * otherwise (the same approach Hoppler's SndPump uses).
+ *
+ * GentleOS's engine calls krn_speaker_set_freq() on every note change and holds
+ * the tone by leaving the frequency set. We map that onto the 8741 by issuing a
+ * TONE command whose length comfortably outlasts one note step; the engine
+ * re-issues it on the next note. A rest/stop issues nothing (the previous tone
+ * simply decays).
  */
 
 #include <kernel.h>
 
 enum {
-    PIT_CR2      = 0x42, /* PIT counter 2 data port */
-    PIT_CWR      = 0x43, /* PIT control word register */
-    PPI_PB       = 0x61, /* Port B of 8255A-5 PPI */
+    KBD_DATA = 0x40,   /* 8741 data register   */
+    KBD_CMD  = 0x41,   /* 8741 command/status  */
+    KBD_IBF  = 0x02,   /* status bit 1: input buffer full */
+
+    SND_CMD_TONE = 0x06,
 };
 
-/* Used instead of silence to prevent glitching in QEMU */
+/*
+ * Tone length written to the 8741, in ~20 ms units (+0x1F bias applied below).
+ * The default timer tick is 10 ms, so a few units outlast one or two note
+ * steps; the engine refreshes it on each note. Kept short so a held "note"
+ * (e.g. a piano key struck on the DMV, which has no key-up) is a clean, finite
+ * stroke rather than a drone.
+ */
+#define DMV_TONE_UNITS 12   /* ~240 ms */
+
+/*
+ * The engine uses this sentinel pitch for a "rest" note (instead of 0) so the
+ * PC speaker wouldn't glitch. On the DMV a rest simply writes no tone.
+ */
 #define REST_PITCH 59659U
+
+/* Not used on the DMV (no 8255 port B), kept for the keyboard ISR's reference. */
+global uint8_t krn_speaker_ppi_bits;
 
 static volatile speaker_state_st krn_speaker_state;
 
-/* Preserved speaker bits of port B, since V86.js doesn't read them back */
-global uint8_t krn_speaker_ppi_bits;
+/*
+ * Convert a frequency in Hz to the 8741 tone index n, rounded to the nearest
+ * chromatic semitone: f = 110 * 2^((n-1)/12), so n = 1 + 12*log2(f/110). We
+ * avoid floating point (no FPU assumptions) by walking the 42 tone frequencies
+ * and picking the closest. Returns 0 for "no playable tone" (silence/too low).
+ */
+static uint8_t
+krn_speaker_hz_to_tone(uint16_t hz)
+{
+    /* f(n) = round(110 * 2^((n-1)/12)) for n = 1..42, precomputed. */
+    static const uint16_t tone_hz[42] = {
+        110, 117, 123, 131, 139, 147, 156, 165, 175, 185, 196, 208,
+        220, 233, 247, 262, 277, 294, 311, 330, 349, 370, 392, 415,
+        440, 466, 494, 523, 554, 587, 622, 659, 698, 740, 784, 831,
+        880, 932, 988, 1047, 1109, 1175
+    };
+    int best = 0;
+    uint16_t best_err = 0xFFFF;
+    int i;
 
+    if (hz == 0) {
+        return 0;
+    }
+
+    for (i = 0; i < 42; ++i) {
+        uint16_t err = (tone_hz[i] > hz) ? (tone_hz[i] - hz) : (hz - tone_hz[i]);
+        if (err < best_err) {
+            best_err = err;
+            best = i;
+        }
+    }
+
+    return (uint8_t)(best + 1);   /* n is 1-based */
+}
+
+/*
+ * Non-blocking 8741 tone write. Returns without doing anything if the input
+ * buffer is still full (a previous tone/command is in flight) - safe to call
+ * from the timer ISR. hz == 0 is a rest: nothing is written (the current tone
+ * finishes on its own), which is what the engine wants between notes.
+ */
 static void
 krn_speaker_set_freq(uint16_t hz)
 {
-    uint8_t val;
-    uint32_t divisor;
+    uint8_t n;
 
-    /* If hz is 0, turn off the speaker */
-    if (hz == 0) {
-        val = krn_inb(PPI_PB);
-        krn_outb(val & ~0x03, PPI_PB);
-        krn_speaker_ppi_bits = 0;
+    if (hz == 0 || hz == REST_PITCH) {
         return;
     }
 
-    (void)udiv32(&divisor, PIT_FREQUENCY, hz);
-    divisor = MIN(divisor, 0xffffUL);
+    n = krn_speaker_hz_to_tone(hz);
+    if (n == 0) {
+        return;
+    }
 
-    /* Configure counter 2 of PIT to mode 3 (square wave) */
-    krn_outb(0xB6, PIT_CWR);
+    /* Only issue the command if the 8741 can accept it right now. */
+    if (krn_inb(KBD_CMD) & KBD_IBF) {
+        return;
+    }
+    krn_outb(SND_CMD_TONE, KBD_CMD);
 
-    /* Set counter 2 to the desired frequency */
-    krn_outb((uint16_t)divisor & 0xFF, PIT_CR2);
-    krn_outb(((uint16_t)divisor >> 8) & 0xFF, PIT_CR2);
+    if (krn_inb(KBD_CMD) & KBD_IBF) {
+        return;
+    }
+    krn_outb((uint8_t)(n + 0x20), KBD_DATA);           /* pitch byte  */
 
-    /* Enable speaker by setting bits 0 (speaker enable) and 1 (gate) on port 0x61 */
-    val = krn_inb(PPI_PB);
-    krn_outb(val | 0x03, PPI_PB);
-    krn_speaker_ppi_bits = 0x03;
+    if (krn_inb(KBD_CMD) & KBD_IBF) {
+        return;
+    }
+    krn_outb((uint8_t)(DMV_TONE_UNITS + 0x1F), KBD_DATA); /* length byte */
 }
 
 /* Must be called while locked or in interrupt context */
