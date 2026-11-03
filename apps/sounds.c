@@ -101,7 +101,8 @@ key_for_key_code(int key_code)
     app_state_st *a = app_state;
     widget_st *w = NULL;
 
-    switch (key_code) {
+    /* the piano is laid out by key position, not by letter (QWERTZ etc.) */
+    switch (krn_keyboard_position((uint8_t)key_code)) {
     case KEY_Z: w = &a->keys_w[0]; break;
     case KEY_X: w = &a->keys_w[1]; break;
     case KEY_C: w = &a->keys_w[2]; break;
@@ -223,11 +224,7 @@ on_show(void)
         a->keys_w[i].draw(&a->keys_w[i]);
     }
 
-    if (krn_keyboard_use_bios) {
-        gui_status_set("This app is not available on this device");
-    } else {
-        gui_status_set("Z-,: Wh/Lo  S-J: Bl/Lo  W-O: Wh/Hi  3-8: Bl/Hi");
-    }
+    gui_status_set("Z-,: Wh/Lo  S-J: Bl/Lo  W-O: Wh/Hi  3-8: Bl/Hi");
 }
 
 static void

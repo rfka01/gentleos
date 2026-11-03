@@ -12,6 +12,14 @@ extern _krn_keyboard_handle_intr
 
 section _TEXT class=CODE
 
+; Bare IRET used to fill unused interrupt vectors on the native DMV boot, where
+; the mainboard leaves the IVT full of garbage (hw doc §1). Every vector points
+; here until a real handler (e.g. the timer on INT 08h) overwrites it, so a
+; stray INT returns harmlessly instead of running through uninitialised memory.
+global _krn_isr_trap
+_krn_isr_trap:
+    iret
+
 global _krn_isr_timer
 _krn_isr_timer:
     push ax

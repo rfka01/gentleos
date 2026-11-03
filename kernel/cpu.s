@@ -30,6 +30,11 @@ _krn_cpu_cli:
     cli
     ret
 
+global _krn_cpu_sti
+_krn_cpu_sti:
+    sti
+    ret
+
 global _krn_cpu_hlt
 _krn_cpu_hlt:
     hlt

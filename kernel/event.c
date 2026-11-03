@@ -65,7 +65,8 @@ krn_event_wait(event_st *out)
             break;
         }
 
-        krn_cpu_hlt();
+        /* HLT with timer interrupts, poll the PIT on a K230 (no IRQs). */
+        krn_timer_idle();
     }
 }
 

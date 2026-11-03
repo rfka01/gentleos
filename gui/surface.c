@@ -14,26 +14,38 @@ enum {
 static uint8_t far *gui_surface_pixels;
 static rect_st gui_surface_dirty_rects[DIRTY_RECTS_MAX];
 static int gui_surface_dirty_rects_count = 0;
-static uint16_t gui_surface_byte_expansions[256];
+
+/*
+ * Bit-reversal lookup. The 1bpp backbuffer stores pixels MSB-first (bit 7 =
+ * leftmost), but a uPD7220 display word has the LSB as the leftmost pixel, so
+ * each backbuffer byte is bit-reversed before being packed into a GDC word.
+ */
+static uint8_t gui_bitrev[256];
+static int gui_bitrev_ready = 0;
+
+static void
+gui_build_bitrev(void)
+{
+    int i, b, r;
+
+    for (i = 0; i < 256; ++i) {
+        r = 0;
+        for (b = 0; b < 8; ++b) {
+            if (i & (1 << b)) {
+                r |= (1 << (7 - b));
+            }
+        }
+        gui_bitrev[i] = (uint8_t)r;
+    }
+
+    gui_bitrev_ready = 1;
+}
 
 global void
 gui_surface_init(void)
 {
-    int i;
-
     gui_surface_pixels = heap_alloc(GUI_FB_PLANE_SIZE);
-
-    for (i = 0; i < 256; ++i) {
-        gui_surface_byte_expansions[i] =
-            (0x00C0 * !!(i & 0x80)) |
-            (0x0030 * !!(i & 0x40)) |
-            (0x000C * !!(i & 0x20)) |
-            (0x0003 * !!(i & 0x10)) |
-            (0xC000 * !!(i & 0x08)) |
-            (0x3000 * !!(i & 0x04)) |
-            (0x0C00 * !!(i & 0x02)) |
-            (0x0300 * !!(i & 0x01));
-    }
+    gui_build_bitrev();
 }
 
 global void
@@ -115,29 +127,157 @@ gui_surface_mark_dirty(const point_st *origin, const rect_st *rect)
     gui_rect_copy(&gui_surface_dirty_rects[gui_surface_dirty_rects_count++], &final_rect);
 }
 
+/* ---- uPD7220 access used by the flush ---------------------------------- */
+
+static void
+gdc_wait_fifo_local(void)
+{
+    int guard = 0x4000;
+    while ((krn_inb(0xA0) & 0x02 /* FIFO full */) && --guard)
+        ;
+}
+
+static void
+gdc_cmd_local(uint8_t c)
+{
+    gdc_wait_fifo_local();
+    krn_outb(c, 0xA1);
+}
+
+static void
+gdc_par_local(uint8_t p)
+{
+    gdc_wait_fifo_local();
+    krn_outb(p, 0xA0);
+}
+
+/*
+ * Position the write address (CURS) and open the MASK to all 16 bits. CURS also
+ * loads MASK from its dot-address field (MASK = 1 << dAD, here 0x0001), so the
+ * MASK must be set again after every CURS - otherwise a word write only touches
+ * its leftmost pixel.
+ */
+static void
+gdc_pos(uint32_t word_addr)
+{
+    gdc_cmd_local(0x49);   /* CURS: set EAD (and MASK = 1 << dAD) */
+    gdc_par_local((uint8_t)(word_addr & 0xFF));
+    gdc_par_local((uint8_t)((word_addr >> 8) & 0xFF));
+    gdc_par_local((uint8_t)((word_addr >> 16) & 0x03));
+    gdc_cmd_local(0x4A);   /* MASK = all bits */
+    gdc_par_local(0xFF);
+    gdc_par_local(0xFF);
+}
+
+/* FIGS: direction +X word, DC = count-1 (14 bits) */
+static void
+gdc_figs(uint16_t dc)
+{
+    gdc_cmd_local(0x4C);
+    gdc_par_local(0x02);
+    gdc_par_local((uint8_t)(dc & 0xFF));
+    gdc_par_local((uint8_t)((dc >> 8) & 0x3F));
+}
+
+/*
+ * Flush one dirty rectangle to whichever colour planes are selected by the
+ * current theme fg/bg plane masks.
+ *
+ * The rectangle goes out in bands of lines; within a band every used plane is
+ * written before the next band starts. (Writing a whole plane before the next
+ * one made a screen change visible in stages on two-colour themes: for a
+ * moment the new image sat in one plane and the old one in the others, a
+ * differently coloured ghost.) A full-width band is contiguous in both the
+ * backbuffer (80 bytes per line) and VRAM (40 words per line), so it goes out
+ * as one burst; a narrower rectangle uses bands of one line.
+ *
+ * Per plane and band (every CURS re-opens the MASK, see gdc_pos()):
+ *  - A "constant" plane (fg and bg agree there) is filled with one repeated
+ *    word: FIGS DC=span-1 and a single WDAT data word.
+ *  - A plane where fg and bg differ follows the pixel bitmap (inverted when
+ *    the plane belongs to the background colour): FIGS DC=0, CURS + WDAT and
+ *    the bytes go out through krn_gdc_stream() (kernel/gdc.s), the assembler
+ *    loop that bit-reverses, inverts and writes them.
+ */
+#define FLUSH_BAND_LINES 8
+
 static void
 gui_surface_flush_rect(const rect_st *rect)
 {
-    int x0, x1, src_word_x, src_words, vram_word_x, y, i;
-    uint8_t far *vram = MK_FP(0xb800, 0);
-    uint16_t far *src;
-    uint16_t far *dst;
-    uint16_t pair;
+    int x0, x1, src_word_x, src_words, y, y_end, band, p;
+    uint16_t band_words;
+    uint8_t used_planes;
+    static const uint32_t plane_base[3] = {
+        GDC_PLANE_BASE_GREEN, GDC_PLANE_BASE_RED, GDC_PLANE_BASE_BLUE
+    };
 
+    if (!gui_bitrev_ready) {
+        gui_build_bitrev();
+    }
+
+    /* Word-align the horizontal span (16 px per display word). */
     x0 = (rect->x / 16) * 16;
     x1 = ((rect->x + rect->width + 15) / 16) * 16;
+    if (x1 > GUI_WIDTH) {
+        x1 = GUI_WIDTH;
+    }
     src_word_x = x0 / 16;
     src_words = (x1 - x0) / 16;
-    vram_word_x = x0 / 8;
+    if (src_words <= 0 || rect->height <= 0) {
+        return;
+    }
+    band = (src_words == GUI_VRAM_WORDS_PER_LINE) ? FLUSH_BAND_LINES : 1;
 
-    for (y = rect->y; y < rect->y + rect->height; ++y) {
-        src = (uint16_t far *)(gui_surface_pixels + y * GUI_FB_PITCH) + src_word_x;
-        dst = (uint16_t far *)(vram + (y % 2) * 0x2000 + (y / 2) * GUI_VRAM_PITCH) + vram_word_x;
+    /*
+     * Only touch planes the current theme actually uses (a bit set in fg or bg
+     * mask). A plane that is neither a foreground nor a background colour stays
+     * constant black, and krn_vga_clear_vram() / a theme change already leaves
+     * it black, so writing it every flush is pure waste. For the default
+     * Green/Black theme (and every single-colour theme, and the whole mono
+     * machine) this cuts the work from three planes to one.
+     */
+    used_planes = (uint8_t)((krn_gdc_fg_mask | krn_gdc_bg_mask) & 0x07);
+    if (used_planes == 0) {
+        used_planes = 0x01;   /* degenerate all-black theme: keep green live */
+    }
 
-        for (i = 0; i < src_words; ++i) {
-            pair = src[i];
-            dst[i * 2] = gui_surface_byte_expansions[pair & 0xFF];
-            dst[i * 2 + 1] = gui_surface_byte_expansions[pair >> 8];
+    y_end = rect->y + rect->height;
+
+    for (y = rect->y; y < y_end; y += band) {
+        int lines = (y_end - y < band) ? (y_end - y) : band;
+
+        band_words = (uint16_t)(lines * src_words);
+
+        for (p = 0; p < 3; ++p) {
+            int fg_here = (krn_gdc_fg_mask >> p) & 1;
+            int bg_here = (krn_gdc_bg_mask >> p) & 1;
+            uint32_t addr;
+
+            if (!((used_planes >> p) & 1)) {
+                continue;   /* plane stays constant black - skip entirely */
+            }
+
+            addr = plane_base[p] + (uint16_t)y * GUI_VRAM_WORDS_PER_LINE
+                 + (uint16_t)src_word_x;
+
+            if (fg_here == bg_here) {
+                uint8_t fill = fg_here ? 0xFF : 0x00;
+
+                gdc_pos(addr);
+                gdc_figs((uint16_t)(band_words - 1));
+                gdc_cmd_local(0x20);    /* WDAT word, replace */
+                gdc_par_local(fill);
+                gdc_par_local(fill);
+                continue;
+            }
+
+            gdc_figs(0);                /* DC=0: each data word written once */
+            gdc_pos(addr);
+            gdc_cmd_local(0x20);        /* WDAT word, replace */
+            krn_gdc_stream(gui_surface_pixels + (uint16_t)y * GUI_FB_PITCH
+                    + src_word_x * 2,
+                (uint16_t)(band_words * 2),
+                fg_here ? 0x00 : 0xFF, gui_bitrev);
         }
     }
 }
