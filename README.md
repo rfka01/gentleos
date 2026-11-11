@@ -1,12 +1,11 @@
 # GentleOS/16
 
-A hobby operating system for vintage 16-bit PCs,
+A fantasy operating system for vintage 16-bit PCs,
 built for tinkering with old hardware on the bare metal.
 
 You can find more information on its [website](https://luke8086.dev/gentleos/16).
 
-It's a simplified version of [GentleOS/32](https://github.com/luke8086/gentleos32),
-targetting i386+ devices.
+<img src="https://luke8086.dev/gentleos/images/gentleos16-photo-t1100fd-nobg.webp" width="300">
 
 ## NCR Decision Mate V port
 
@@ -29,14 +28,18 @@ What the port changes vs. upstream (all documented in
   machines are detected at runtime from the mainboard ROM version byte
   (`M.07.00` / `C.07.00`); on a mono display colour themes collapse to green.
 - **Timer** — natively the DMV is not PC-compatible: the tick is 8253 channel 2
-  (ports 0x82/0x83, 500 kHz clock) and the interrupt controller is an 8259 at
-  ports 0x90/0x91 in AEOI mode. `kernel/timer.c` programs these directly when
-  not under DOS; under DOS it uses the PC PIT path.
+  (ports 0x82/0x83, 500 kHz clock). With the K235 CPU card it interrupts through
+  the 8259 at ports 0x90/0x91; the K230 has no interrupt controller, so
+  `kernel/timer.c` detects that and polls the counter instead (and still reports
+  `system_info.timer_available`). Under DOS it uses the PC PIT path.
 - **Interrupt vectors** — on a native boot the mainboard leaves the IVT full of
   garbage, so `kernel/main.c` fills all 256 vectors with an IRET trap before
   enabling interrupts (this is what cured the old instant-reboot loop).
 - **Keyboard** — natively the 8741 MCU on ports 0x40/0x41, translated in
-  `kernel/bios.c`; under DOS, INT 16h.
+  `kernel/bios.c`; under DOS, INT 16h. Neither reports key-up, so one is
+  synthesised (`system_info.keyboard_native` stays 0). The keyboard's language
+  code is read from the 8741, so the Sounds piano follows key positions.
+- **Sound** — there is no PC speaker; tones go to the 8741 (TONE command 06h).
 - **Clock** — the RTC is never written (matching upstream), so GentleOS keeps
   its own running time without clashing with the DOS date encoding.
 
@@ -51,50 +54,28 @@ sh tools/mkdmv.sh        # -> GT16DMV.IMG (native, no-DOS 360K floppy)
 The standard `wmake` build already produces the PC images, and `GT16.COM`
 itself is the DOS-launched build for the DMV.
 
-## Building
-
-The only prerequisite is [DOSBox](https://www.dosbox.com/), the
-entire toolchain (OpenWatcom, NASM, Perl) is included in the repo.
-
-To build GentleOS, start DOSBox from the source directory and run
-the following commands:
-
-```dos
-Z:\>MOUNT C .
-Z:\>C:
-C:\>ENV
-C:\>AUTOGEN
-C:\>WMAKE
-```
-
-## Development notes
-
-- The official compiler is [OpenWatcom 1.9](https://www.openwatcom.org/),
-  because it can be freely distributed, but
-  [Turbo C 2.01](https://duckduckgo.com/?q=Turbo+C+2x)
-  is also supported and it's much faster.
-  You can install it to `C:\TMP\TC` and use with `WMAKE TC=1`
-
-- For faster compilation, you can try setting `cycles=fixed 99999`
-  in the `[cpu]` section of your DOSBox config file
-
-- For a quick turnaround, GentleOS can be started as a COM file
-  with `GT16.COM`. Pressing `Shift-Q` returns back to DOS.
-
 ## Attributions
 
-- All images in [vendor/icons8](vendor/icons8) have been sourced from
+- Assets in [vendor/icons8](vendor/icons8) have been sourced from
   [Icons8](https://icons8.com/) using the
   [free license](https://web.archive.org/web/20260325111643/https://icons8.com/license)
   and modified
 
-- All images in [vendor/mona](vendor/mona) have been extracted from the
+- Assets in [vendor/mona](vendor/mona) have been extracted from the
   [Mona Font](https://github.com/MonadABXY/mona-font) and modified
   ([LICENSE](vendor/mona/LICENSE.txt))
 
-- All fonts in [vendor/int10h](vendor/int10h) have been extracted from the
+- Assets in [vendor/int10h](vendor/int10h) have been extracted from the
   [The Ultimate Oldschool PC Font Pack](https://int10h.org/oldschool-pc-fonts/)
   and modified ([LICENSE](vendor/int10h/LICENSE.txt))
+
+- Sokoban levels in [vendor/sokoban](vendor/sokoban) have been created by
+  David W. Skinner and obtained from the
+  [Sasquatch collection](https://web.archive.org/web/20040725085419/https://users.bentonrea.com/~sasquatch/sokoban/)
+  ([README](vendor/sokoban/README.txt))
+
+- Assets in [vendor/misc](vendor/misc) have been found online and modified
+  ([README](vendor/misc/README.txt))
 
 ## Contributors
 

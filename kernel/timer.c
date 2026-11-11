@@ -77,6 +77,8 @@ krn_timer_tick(void)
 {
     event_st event;
 
+    system_info.timer_available = 1;
+
     /* At default 18.2Hz freq this drifts by ~2min/day */
     timer_msecs += timer_msecs_per_tick;
 
@@ -327,6 +329,13 @@ krn_timer_init(void)
             poll_clocks = 0;
             poll_tick_clocks = DMV_TICK_DIVISOR;
             timer_polled = 1;
+
+            /*
+             * The tick still arrives (through krn_timer_poll()), so apps that
+             * check system_info.timer_available must not treat a K230 as a
+             * machine without a timer. Upstream only sets the flag in the ISR.
+             */
+            system_info.timer_available = 1;
         }
 
         krn_debug_printf("ok (DMV, %s)\n", timer_polled ? "polled" : "interrupt");

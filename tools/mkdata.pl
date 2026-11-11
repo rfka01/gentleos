@@ -23,20 +23,28 @@ my $INITRD_PATH         = "GT16.DAT";
 
 my @INITRD_SPK_GLOBS = (
     "assets/spk/*.spk",
+    "usrmedia/*.spk",
 );
 
 my @INITRD_BITMAP_GLOBS = (
     "vendor/misc/*.pbm",
+    "usrmedia/*.pbm",
+);
+
+my @INITRD_SOKOBAN_GLOBS = (
+    "vendor/sokoban/levels.sbn",
 );
 
 my $FILE_TYPE_UNKNOWN = 0;
 my $FILE_TYPE_BITMAP  = 1;
 my $FILE_TYPE_SONG    = 2;
+my $FILE_TYPE_SOKOBAN = 3;
 
 my @FILE_TYPE_NAMES = (
     "unknown",
     "bitmap",
     "song",
+    "sokoban",
 );
 
 my $FILE_MAX_SIZE = 0xfff0;    # Must be addressable through one far pointer
@@ -156,6 +164,7 @@ sub process_bitmap {
     $prefix = "card_" if $dirname eq "assets/cards";
     $prefix = "sprite_" if $dirname eq "assets/sprites";
     $prefix = "sprite_mj_" if $dirname eq "assets/mahjong";
+    $prefix = "sprite_sb_" if $dirname eq "assets/sokoban";
     $prefix = "glyph_mn_" if $dirname eq "vendor/mona";
 
     my @lines = (
@@ -177,6 +186,7 @@ sub process_bitmaps {
         glob("assets/icons/*.pbm"),
         glob("assets/cards/*.pbm"),
         glob("assets/mahjong/*.pbm"),
+        glob("assets/sokoban/*.pbm"),
         glob("assets/sprites/*.pbm"),
         glob("vendor/icons8/*.pbm"),
         glob("vendor/mona/*.pbm"),
@@ -282,20 +292,20 @@ sub process_fonts {
 
 sub read_spk {
     my ($path) = @_;
-    my %meta;
     my @segments;
 
     open(my $fh, "<", $path) or die "Cannot read $path: $!\n";
 
+    my $title = <$fh>;
+    $title = "" if !defined $title;
+    $title =~ s/^\s+|\s+$//g;
+
+    die "Error: no title in $path\n" if $title eq "";
+
     while (my $line = <$fh>) {
         next if $line =~ /^\s*$/;
 
-        if ($line =~ /^\s*(\w+)\s*:\s*(.+?)\s*$/) {
-            $meta{$1} = $2;
-            next;
-        }
-
-        if ($line =~ /^\s*(\d+)\s*,\s*(\d+)\s*$/) {
+        if ($line =~ /^\s*(\d+)\s+(\d+)\s*$/) {
             my $pitch = min(int($1), 0xffff);
             my $duration = max(min(int($2), 0xffff), 1);
 
@@ -308,10 +318,9 @@ sub read_spk {
 
     close $fh;
 
-    die "Error: no title in $path\n" if $meta{title} eq "";
     die "Error: no notes in $path\n" if !@segments;
 
-    return ($meta{title}, \@segments);
+    return ($title, \@segments);
 }
 
 sub process_spk {
@@ -371,6 +380,21 @@ sub process_initrd_bitmap {
     };
 }
 
+sub process_initrd_sokoban {
+    my ($path) = @_;
+
+    my $name = uc(basename($path));
+    my $data = slurp($path);
+
+    printf "- %s... ok (%d levels)\n", $path, unpack("v", $data);
+
+    return {
+        name => substr($name, 0, $INITRD_NAME_LEN - 1),
+        type => $FILE_TYPE_SOKOBAN,
+        data => $data,
+    };
+}
+
 sub build_initrd_image {
     my (@files) = @_;
 
@@ -403,11 +427,13 @@ sub make_initrd {
 
     my @spk_paths = sort(map(glob, @INITRD_SPK_GLOBS));
     my @bitmap_paths = sort(map(glob, @INITRD_BITMAP_GLOBS));
+    my @sokoban_paths = sort(map(glob, @INITRD_SOKOBAN_GLOBS));
 
     my @files;
 
     push @files, map { process_spk($_) } (@spk_paths);
     push @files, map { process_initrd_bitmap($_) } @bitmap_paths;
+    push @files, map { process_initrd_sokoban($_) } @sokoban_paths;
 
     print "\nGenerating initrd:\n";
 

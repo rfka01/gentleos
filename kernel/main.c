@@ -58,6 +58,23 @@ krn_check_load(void)
     krn_debug_printf("ok (flags: %02x)\n", krn_flags);
 }
 
+static void
+krn_main_pause(void)
+{
+    event_st event;
+    uint32_t start = krn_timer_get_msecs();
+
+    krn_debug_printf("Please wait for 2s or press any key to skip the pause\n");
+
+    while (krn_timer_get_msecs() - start < 2000) {
+        krn_event_wait(&event);
+
+        if (event.type == EVENT_KEY_DOWN) {
+            break;
+        }
+    }
+}
+
 global void
 krn_main(void)
 {
@@ -94,15 +111,13 @@ krn_main(void)
 
     krn_rtc_init();
 
-    krn_debug_printf("Starting GUI...\n");
-
     /*
-     * Upstream pauses 2 s so the boot messages can be read before the GUI
-     * takes over the screen. On a native DMV boot there is no text console
-     * (no BIOS), so there is nothing to read - skip the wait.
+     * Upstream pauses 2 s (or until a key) so the boot messages can be read
+     * before the GUI takes over the screen. On a native DMV boot there is no
+     * text console (no BIOS), so there is nothing to read - skip the pause.
      */
     if (!native) {
-        sleep(2000);
+        krn_main_pause();
     }
 
     krn_vga_init();

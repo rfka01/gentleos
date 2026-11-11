@@ -83,13 +83,15 @@ enum {
  * fg_color holds the foreground mask, bg_color the background mask.
  */
 global const vga_theme_st krn_vga_themes[VGA_THEME_COUNT] = {
-    { 0x07, 0x00, "White/Black" },   /* white on black  */
-    { 0x01, 0x00, "Green/Black" },   /* green on black  */
-    { 0x02, 0x00, "Red/Black"   },   /* red   on black  */
-    { 0x04, 0x00, "Blue/Black"  },   /* blue  on black  */
-    { 0x05, 0x00, "Cyan/Black"  },   /* cyan  on black  */
-    { 0x05, 0x04, "Cyan/Blue"   },   /* cyan  on blue   */
+    { 0x07, 0x00, "White/Black" },   /* white  on black */
+    { 0x01, 0x00, "Green/Black" },   /* green  on black */
+    { 0x03, 0x00, "Yellow/Blck" },   /* yellow on black (upstream's name) */
+    { 0x02, 0x00, "Red/Black"   },   /* red    on black */
+    { 0x04, 0x00, "Blue/Black"  },   /* blue   on black */
+    { 0x05, 0x00, "Cyan/Black"  },   /* cyan   on black */
+    { 0x05, 0x04, "Cyan/Blue"   },   /* cyan   on blue  */
     { 0x03, 0x04, "Yellow/Blue" },   /* yellow on blue  */
+    { 0x07, 0x04, "White/Blue"  },   /* white  on blue  */
 };
 
 /* Default theme: Green/Black (index 1) suits both colour and mono displays. */
@@ -170,7 +172,7 @@ gdc_param(uint8_t p)
 static void
 gdc_wait_vsync(void)
 {
-    int guard = 0x8000;
+    unsigned guard = 0x8000;
     /* wait for VSYNC (status bit 5), with timeout so we never hang */
     while (!(krn_inb(GDC_STAT) & GDC_ST_VSYNC) && --guard)
         ;
@@ -251,6 +253,15 @@ krn_vga_set_theme(int n)
     if (krn_vga_is_mono()) {
         krn_gdc_fg_mask = krn_gdc_fg_mask ? 0x01 : 0x00;
         krn_gdc_bg_mask = krn_gdc_bg_mask ? 0x01 : 0x00;
+
+        /*
+         * A coloured background (e.g. Yellow/Blue) would light the one plane
+         * for fg AND bg - an all-green screen. Keep it readable: lit text on
+         * black, like the single-colour themes.
+         */
+        if (krn_gdc_fg_mask && krn_gdc_bg_mask) {
+            krn_gdc_bg_mask = 0x00;
+        }
     }
 
     krn_vga_current_theme = n;

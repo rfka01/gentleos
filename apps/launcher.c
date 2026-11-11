@@ -41,6 +41,7 @@ static app_st *apps[] = {
     &app_mines,
     &app_pairs,
     &app_mahjong,
+    &app_sokoban,
     &app_snake,
     &app_tetris,
     &app_2048,
@@ -97,6 +98,10 @@ static void
 update_status_br(void)
 {
     time_st t;
+
+    if (!system_info.timer_available) {
+        return;
+    }
 
     time_get(&t);
 

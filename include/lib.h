@@ -58,7 +58,7 @@ typedef int32_t ssize_t;
 
 #define global
 
-#define NULL ((void *)0)
+#define NULL 0
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -112,6 +112,7 @@ enum {
     FILE_TYPE_UNKNOWN,
     FILE_TYPE_BITMAP,
     FILE_TYPE_SONG,
+    FILE_TYPE_SOKOBAN,
     FILE_TYPE_COUNT,
 };
 
@@ -122,6 +123,9 @@ typedef struct {
 
     uint16_t initrd_files_count;
     file_st far *initrd_files;
+
+    volatile int keyboard_native;
+    volatile int timer_available;
 } system_info_st;
 
 typedef struct {

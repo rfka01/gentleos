@@ -16,7 +16,6 @@ enum {
 
 static isr_st saved_isr_handler;
 extern void *krn_isr_keyboard;
-global volatile int krn_keyboard_use_bios = 1;
 
 global uint16_t
 krn_keyboard_getc(void)
@@ -106,7 +105,7 @@ krn_keyboard_handle_intr(void)
     uint8_t ctrl;
     uint8_t scan = krn_inb(PS2_PORT_DATA);
 
-    krn_keyboard_use_bios = 0;
+    system_info.keyboard_native = 1;
 
     krn_keyboard_handle_scancode(scan);
 
@@ -228,7 +227,7 @@ krn_keyboard_init(void)
      * path that is wired to the 8259 at 0x90/0x91. So we never take the PS/2
      * IRQ route: input always comes through the poll path
      * (krn_keyboard_handle_bios -> INT 16h under DOS, or the 8741 MCU on ports
-     * 0x40/0x41 natively). krn_keyboard_use_bios stays 1.
+     * 0x40/0x41 natively). system_info.keyboard_native stays 0.
      */
     (void)si;
 

@@ -13,6 +13,7 @@ extern void krn_bios_reboot(void);
 extern int krn_debug_text_mode_enabled;
 extern void (*krn_debug_status_cb)(const char *, ...);
 extern void krn_debug_printf(const char *fmt, ...);
+extern void krn_debug_fatal(unsigned beeps, const char *fmt, ...);
 extern void krn_debug_assert(int expr, const char *file, unsigned line);
 extern void krn_debug_beep_adv(unsigned hz, unsigned msecs, unsigned count);
 extern void krn_debug_beep(void);
@@ -25,7 +26,6 @@ extern uint16_t krn_event_count(void);
 /* kernel/initrd.c */
 extern void krn_initrd_init(void);
 /* kernel/keyboard.c */
-extern volatile int krn_keyboard_use_bios;
 extern uint16_t krn_keyboard_getc(void);
 extern void krn_keyboard_handle_intr(void);
 extern void krn_keyboard_handle_bios(void);
@@ -56,6 +56,7 @@ extern void krn_speaker_play_freq(uint16_t hz, void *owner);
 extern void krn_speaker_pause(void *owner);
 extern void krn_speaker_resume(void *owner);
 extern void krn_speaker_stop(void *owner);
+extern void krn_speaker_seek(void *owner, uint32_t ticks);
 extern void krn_speaker_on_tick(void);
 extern void krn_speaker_deinit(void);
 /* kernel/timer.c */
