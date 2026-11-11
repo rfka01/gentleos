@@ -11,6 +11,7 @@
 /MAKEFILE
 /Makefile
 /data/*
+/DATA/*
 /config.h
 /tmp/*
 /usrmedia/*
